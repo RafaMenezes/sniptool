@@ -1,0 +1,12 @@
+[package]
+name = "sniptool"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib"]  # Required for cross-platform shared libraries (e.g., Android/iOS)
+
+[dependencies]
+image = "0.25.1"         # For saving images (PNGs)
+once_cell = "1.19.0"     # For holding global state safely
+crossbeam-channel = "0.5"
