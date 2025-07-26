@@ -1,117 +1,107 @@
 use std::ffi::CStr;
-use std::fs::create_dir_all;
 use std::os::raw::c_char;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use once_cell::sync::Lazy;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::sync::atomic::{AtomicBool, Ordering};
-use crossbeam_channel::{Sender, Receiver, bounded};
+use crossbeam_channel::{bounded, Sender};
 use image::{ImageBuffer, Rgba};
+use std::fs::create_dir_all;
 use std::process::Command;
+use std::process::Stdio;
 
-// === Threaded Frame Worker ===
-struct RecordingSession {
-    output_dir: PathBuf,
-    sender: Sender<FrameData>,
-    running: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-    frame_counter: Arc<Mutex<u32>>,
-}
-
+// === Frame Struct ===
 struct FrameData {
     pixels: Vec<u8>,
     width: u32,
     height: u32,
-    frame_index: u32,
+    index: u32,
 }
 
-use std::sync::Arc;
+// === Recording Session ===
+struct RecordingSession {
+    sender: Sender<FrameData>,
+    handle: thread::JoinHandle<()>,
+    frame_counter: u32,
+}
+
+fn log(msg: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/rafajm/Library/Application Support/Godot/app_userdata/PP_auto/sniplog.txt")
+    {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
+
 
 impl RecordingSession {
     fn new(output_dir: PathBuf) -> std::io::Result<Self> {
-        if !output_dir.exists() {
-            create_dir_all(&output_dir)?;
-        }
+        create_dir_all(&output_dir)?;
 
-        let (sender, receiver): (Sender<FrameData>, Receiver<FrameData>) = bounded(60);
-        let running = Arc::new(AtomicBool::new(true));
-        let frame_counter = Arc::new(Mutex::new(0));
-
-        let dir_clone = output_dir.clone();
-        let running_clone = running.clone();
-        let counter_clone = frame_counter.clone();
+        let (sender, receiver) = bounded::<FrameData>(1000);
 
         let handle = thread::spawn(move || {
-            while running_clone.load(Ordering::Relaxed) {
-                if let Ok(frame) = receiver.recv() {
-                    let filename = format!("frame_{:05}.png", frame.frame_index);
-                    let filepath = dir_clone.join(filename);
-
-                    if let Some(image) = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, frame.pixels) {
-                        let _ = image.save(filepath);
-                    }
+            for frame in receiver {
+                let filename = format!("frame_{:05}.png", frame.index);
+                let filepath = output_dir.join(filename);
+                if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, frame.pixels) {
+                    let _ = img.save(filepath);
+                    log(&format!("Saving frame {}", frame.index));
                 }
             }
         });
 
         Ok(Self {
-            output_dir,
             sender,
-            running,
-            handle: Some(handle),
-            frame_counter,
+            handle,
+            frame_counter: 0,
         })
     }
 
-    fn queue_frame(&self, pixels: &[u8], width: u32, height: u32) -> bool {
-        let mut counter = self.frame_counter.lock().unwrap();
-        let index = *counter;
-        *counter += 1;
-
-        let data = FrameData {
+    fn queue_frame(&mut self, pixels: &[u8], width: u32, height: u32) -> bool {
+        let frame = FrameData {
             pixels: pixels.to_vec(),
             width,
             height,
-            frame_index: index,
+            index: self.frame_counter,
         };
-
-        self.sender.try_send(data).is_ok()
+        self.frame_counter += 1;
+        self.sender.send(frame).is_ok()
     }
 
     fn stop(self) {
-        self.running.store(false, Ordering::Relaxed);
+        // Dropping sender causes the thread to exit (receiver gets EOF)
         drop(self.sender);
-        if let Some(handle) = self.handle {
-            let _ = handle.join();
-        }
+        let _ = self.handle.join();
     }
 }
 
-static SESSION: Lazy<Mutex<Option<RecordingSession>>> = Lazy::new(|| Mutex::new(None));
+// === Global Session ===
+static SESSION: OnceLock<Mutex<Option<RecordingSession>>> = OnceLock::new();
+
+fn session() -> &'static Mutex<Option<RecordingSession>> {
+    SESSION.get_or_init(|| Mutex::new(None))
+}
 
 #[no_mangle]
 pub extern "C" fn start_recording(output_path: *const c_char) -> bool {
-    let c_str = unsafe {
-        if output_path.is_null() {
-            return false;
-        }
-        CStr::from_ptr(output_path)
-    };
-
+    let c_str = unsafe { CStr::from_ptr(output_path) };
     let path_str = match c_str.to_str() {
         Ok(s) => s,
         Err(_) => return false,
     };
 
     let path = PathBuf::from(path_str);
-
     match RecordingSession::new(path) {
-        Ok(session) => {
-            let mut global = SESSION.lock().unwrap();
-            *global = Some(session);
+        Ok(sess) => {
+            let mut guard = session().lock().unwrap();
+            *guard = Some(sess);
             true
-        },
+        }
         Err(_) => false,
     }
 }
@@ -122,12 +112,12 @@ pub extern "C" fn save_frame(pixels_ptr: *const u8, width: u32, height: u32) -> 
         return false;
     }
 
-    let total_bytes = (width * height * 4) as usize;
-    let buffer = unsafe { std::slice::from_raw_parts(pixels_ptr, total_bytes) };
+    let num_bytes = (width * height * 4) as usize;
+    let pixels = unsafe { std::slice::from_raw_parts(pixels_ptr, num_bytes) };
 
-    let global = SESSION.lock().unwrap();
-    if let Some(ref session) = *global {
-        session.queue_frame(buffer, width, height)
+    let mut guard = session().lock().unwrap();
+    if let Some(ref mut s) = *guard {
+        s.queue_frame(pixels, width, height)
     } else {
         false
     }
@@ -135,8 +125,8 @@ pub extern "C" fn save_frame(pixels_ptr: *const u8, width: u32, height: u32) -> 
 
 #[no_mangle]
 pub extern "C" fn stop_recording() -> bool {
-    let mut global = SESSION.lock().unwrap();
-    if let Some(session) = global.take() {
+    let mut guard = session().lock().unwrap();
+    if let Some(session) = guard.take() {
         session.stop();
         true
     } else {
@@ -146,6 +136,7 @@ pub extern "C" fn stop_recording() -> bool {
 
 #[no_mangle]
 pub extern "C" fn make_video(input_dir: *const c_char, output_path: *const c_char) -> bool {
+    
     let input_cstr = unsafe {
         if input_dir.is_null() {
             return false;
@@ -170,7 +161,7 @@ pub extern "C" fn make_video(input_dir: *const c_char, output_path: *const c_cha
 
     let input_pattern = format!("{}/frame_%05d.png", input_str);
 
-    let result = Command::new("ffmpeg")
+    let result = Command::new("/opt/homebrew/bin/ffmpeg")
         .args([
             "-y",
             "-framerate", "10",
@@ -179,7 +170,26 @@ pub extern "C" fn make_video(input_dir: *const c_char, output_path: *const c_cha
             "-pix_fmt", "yuv420p",
             output_str,
         ])
-        .status();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
 
-    result.map(|s| s.success()).unwrap_or(false)
+    match result {
+        Ok(output) => {
+            log(&format!("🔧 FFmpeg stdout:\n{}", String::from_utf8_lossy(&output.stdout)));
+            log(&format!("❗️FFmpeg stderr:\n{}", String::from_utf8_lossy(&output.stderr)));
+            output.status.success()
+        }
+        Err(e) => {
+            log(&format!("❌ Failed to run FFmpeg: {}", e));
+            false
+        }
+    }
+
+
+    // result.map(|s| s.success()).unwrap_or_else(|error| {
+    //     log(&format!("Problem making video: {}", error));
+    //     false // or any default value expected by the context
+    // })
+
 }
